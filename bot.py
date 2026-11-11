@@ -676,6 +676,39 @@ def strip_fences(t):
     return t.strip() + "\n"
 
 
+def unwrap_multipart(text):
+    """If the pasted text is a raw multipart/form-data body (what the Cloudflare API returns when you
+    download a worker), pull out the main JS module and the metadata. Returns (code, meta) or None."""
+    t = text.lstrip("\ufeff \r\n\t")
+    first = t.split("\n", 1)[0].strip()
+    if not re.match(r"^--[0-9A-Za-z'()+_,./:=?-]{8,}$", first) or "content-disposition" not in t[:3000].lower():
+        return None
+    meta, mods = {}, []
+    for part in t.split(first):
+        if part.startswith("--") or not part.strip():
+            continue
+        m = re.split(r"\r?\n\r?\n", part.lstrip("\r\n"), maxsplit=1)
+        if len(m) < 2:
+            continue
+        head, body = m[0].lower(), re.sub(r"\r?\n$", "", m[1])
+        name = (re.search(r'name="([^"]*)"', head) or [None, ""])[1]
+        fname = (re.search(r'filename="([^"]*)"', head) or [None, ""])[1]
+        if "application/json" in head or name == "metadata":
+            try:
+                meta = json.loads(body)
+            except ValueError:
+                pass
+        elif "javascript" in head or name.endswith((".js", ".mjs")) or fname.endswith((".js", ".mjs")):
+            mods.append((fname or name, body))
+    if not mods:
+        return ("", meta)
+    want = meta.get("main_module") or meta.get("body_part")
+    for n, b in mods:
+        if n == want:
+            return (b.strip() + "\n", meta)
+    return (mods[0][1].strip() + "\n", meta)
+
+
 def worker_kind(code):
     if re.search(r"\bexport\s+(default|\{)", code):
         return "module"
@@ -701,13 +734,16 @@ def syntax_check(code, kind):
             pass
 
 
-def upload_worker(cf, acc, name, code, kind):
+def upload_worker(cf, acc, name, code, kind, src_meta=None):
+    src_meta = src_meta or {}
+    cdate = src_meta.get("compatibility_date") or COMPAT_DATE
     if kind == "module":
-        meta = {"main_module": "worker.js", "compatibility_date": COMPAT_DATE, "compatibility_flags": ["nodejs_compat"]}
+        meta = {"main_module": "worker.js", "compatibility_date": cdate,
+                "compatibility_flags": src_meta.get("compatibility_flags") or ["nodejs_compat"]}
         files = {"metadata": (None, json.dumps(meta), "application/json"),
                  "worker.js": ("worker.js", code.encode("utf-8"), "application/javascript+module")}
     else:
-        meta = {"body_part": "script.js", "compatibility_date": COMPAT_DATE}
+        meta = {"body_part": "script.js", "compatibility_date": cdate}
         files = {"metadata": (None, json.dumps(meta), "application/json"),
                  "script.js": ("script.js", code.encode("utf-8"), "application/javascript")}
     cf.call("PUT", "/accounts/%s/workers/scripts/%s" % (acc, name), files=files)
@@ -774,7 +810,7 @@ def job_worker(chat):
             ask_subdomain(chat, "worker", serr)
             return
         say(chat, "🚀 در حال ساخت ورکر %s ..." % name)
-        upload_worker(cf, acc, name, s["wcode"], s["wkind"])
+        upload_worker(cf, acc, name, s["wcode"], s["wkind"], s.get("wmeta"))
         try:
             cf.call("POST", "/accounts/%s/workers/scripts/%s/subdomain" % (acc, name), json={"enabled": True})
         except CFError as e:
@@ -987,6 +1023,18 @@ def handle(msg):
             say(chat, "❌ " + str(e))
             return
         code = strip_fences(code)
+        src_meta, note = {}, ""
+        mp = unwrap_multipart(code)
+        if mp:
+            code, src_meta = mp
+            if not code.strip():
+                say(chat, "❌ متن به‌شکل multipart بود ولی فایل JS ورکر داخلش پیدا نشد.")
+                return
+            note = "\nℹ️ متن به‌شکل multipart (خروجی API کلودفلر) بود؛ کد ورکر رو ازش جدا کردم."
+            binds = [("%s:%s" % (b.get("name"), b.get("type"))) for b in src_meta.get("bindings", []) if b.get("name")]
+            if binds:
+                note += ("\n⚠️ این ورکر باندینگ داشت (%s) که اینجا ساخته یا وصل نمیشه؛ اگه کد بهشون نیاز داره، "
+                         "کد رو توی ریپوی گیت‌هاب بذار و از /repo استفاده کن." % ", ".join(binds[:8]))
         kind = worker_kind(code)
         if not kind:
             say(chat, "❌ کد ورکر معتبر نیست. باید export default { fetch } یا addEventListener('fetch', ...) داشته باشه. دوباره بفرست.")
@@ -998,9 +1046,9 @@ def handle(msg):
         if not ok:
             say(chat, "❌ کد خطای سینتکس داره:\n" + err + "\n\nاصلاحش کن و دوباره بفرست.")
             return
-        s["wcode"], s["wkind"] = code, kind
+        s["wcode"], s["wkind"], s["wmeta"] = code, kind, src_meta
         s["state"] = "wname"
-        say(chat, NAME_PROMPT)
+        say(chat, NAME_PROMPT + note)
         return
     if st in ("wname", "wconfirm"):
         if st == "wconfirm":
