@@ -116,22 +116,19 @@ def ensure_queue(cf, acc, name):
             raise
 
 
-def ensure_subdomain(cf, acc):
-    """Returns the account's workers.dev subdomain, registering one if missing."""
+def get_subdomain(cf, acc):
+    """Returns (subdomain or None, error text or None). Never creates or renames anything."""
     try:
-        sub = cf.call("GET", "/accounts/%s/workers/subdomain" % acc)
-        if sub and sub.get("subdomain"):
-            return sub["subdomain"]
-    except CFError:
-        pass
-    import random
-    import string
-    new = "u" + "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(9))
-    try:
-        cf.call("PUT", "/accounts/%s/workers/subdomain" % acc, json={"subdomain": new})
-        return new
-    except CFError:
-        return None
+        r = cf.call("GET", "/accounts/%s/workers/subdomain" % acc)
+        if r and r.get("subdomain"):
+            return r["subdomain"], None
+        return None, None
+    except CFError as e:
+        return None, str(e)
+
+
+def set_subdomain(cf, acc, name):
+    cf.call("PUT", "/accounts/%s/workers/subdomain" % acc, json={"subdomain": name})
 
 
 # --------------------------------------------------------------------------- repo helpers
@@ -306,6 +303,50 @@ HEX32 = re.compile(r"^[0-9a-f]{32}$")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
+import uuid as _uuid
+
+UUID4 = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b")
+UUID_KEEP = {"258eafa5-e914-47da-95ca-c5ab0dc85b11"}  # WebSocket handshake GUID (protocol constant)
+UUID_SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".wrangler", "test", "tests", "__tests__", "docs",
+                  "doc", "example", "examples", "fixtures"}
+UUID_VARS = {"UUID", "USER_UUID", "USERID", "USER_ID", "UID"}
+
+
+def randomize_uuids(root):
+    """Replace hardcoded UUID v4 literals in JS/TS sources with fresh ones (same old -> same new).
+    Returns list of (relative file, count, old uuid prefix)."""
+    mapping, report = {}, []
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in UUID_SKIP_DIRS]
+        for f in fn:
+            if not f.endswith((".js", ".mjs", ".ts", ".tsx", ".jsx")) or f.endswith(".d.ts") or ".test." in f or ".spec." in f:
+                continue
+            path = os.path.join(dp, f)
+            try:
+                if os.path.getsize(path) > 5_000_000:
+                    continue
+                txt = open(path, encoding="utf-8").read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            hits = []
+
+            def rep(m):
+                old = m.group(0)
+                lo = old.lower()
+                if lo in UUID_KEEP:
+                    return old
+                new = mapping.get(lo) or mapping.setdefault(lo, str(_uuid.uuid4()))
+                hits.append(lo)
+                return new.upper() if old.isupper() else new
+
+            new_txt = UUID4.sub(rep, txt)
+            if hits:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(new_txt)
+                report.append((os.path.relpath(path, root), len(hits), hits[0][:8]))
+    return report
+
+
 def prepare_config(cfg, root, cf, acc, worker, progress=lambda m: None):
     """Fill/patch the wrangler config. Returns (cfg, created, warnings, var_candidates, d1_list)."""
     created, warnings = [], []
@@ -327,6 +368,12 @@ def prepare_config(cfg, root, cf, acc, worker, progress=lambda m: None):
     cfg["workers_dev"] = True
     for k in ("route", "routes", "zone_id", "zone_name"):
         cfg.pop(k, None)
+
+    extra = {"gen_vars": {}, "vars_randomized": []}
+    for k, v in list((cfg.get("vars") or {}).items()):
+        if isinstance(v, str) and UUID4.fullmatch(v) and v.lower() not in UUID_KEEP:
+            cfg["vars"][k] = str(_uuid.uuid4())
+            extra["vars_randomized"].append(k)
 
     cfg.setdefault("d1_databases", [])
     cfg.setdefault("kv_namespaces", [])
@@ -399,9 +446,13 @@ def prepare_config(cfg, root, cf, acc, worker, progress=lambda m: None):
             cfg.pop(key)
 
     auto = {"CF_API_TOKEN", "CF_ACCOUNT_ID", "WORKER_NAME"}
-    candidates = sorted(n for n, k in kinds.items() if k == "var" and n not in configured and n not in auto)
+    for n, k in kinds.items():
+        if k == "var" and n in UUID_VARS and n not in configured:
+            extra["gen_vars"][n] = str(_uuid.uuid4())
+    candidates = sorted(n for n, k in kinds.items()
+                        if k == "var" and n not in configured and n not in auto and n not in extra["gen_vars"])
     used_auto = sorted(n for n in kinds if n in auto and n not in configured)
-    return cfg, created, warnings, candidates, used_auto
+    return cfg, created, warnings, candidates, used_auto, extra
 
 
 def find_schema(root):
@@ -461,7 +512,7 @@ WELCOME = (
     "• Account Settings: Read\n\n"
     "ساخت توکن: dash.cloudflare.com/profile/api-tokens\n"
     "• برای وصل کردن دامنه‌ی خودت هم Zone → Zone:Read لازمه.\n\n"
-    "بعد از ورود توکن:\n/repo ← دیپلوی ریپوی گیت‌هاب\n/worker ← ساخت ورکر از کد آماده\n/logout ← پاک کردن توکن از حافظه\n"
+    "بعد از ورود توکن:\n/repo ← دیپلوی ریپوی گیت‌هاب\n/worker ← ساخت ورکر از کد آماده\n/subdomain ← دیدن ساب‌دامین workers.dev حساب\n/logout ← پاک کردن توکن از حافظه\n"
     "فقط ریپوهای خودت رو بده، چون کدشون روی سرور ربات build میشه."
 )
 
@@ -489,14 +540,16 @@ def job_prepare(chat):
             say(chat, "ریپو خصوصیه یا پیدا نشد. اگه خصوصیه، یه GitHub Token (با دسترسی خوندن ریپو) بفرست. وگرنه لینک رو چک کن و /start بزن.")
             return
         s["root"] = root
+        s["uuid_report"] = randomize_uuids(root) if os.environ.get("RANDOMIZE_UUID", "1") != "0" else []
         worker = sanitize_name(r["name"] or r["repo"])
         s["worker"] = worker
         cf = CloudflareAPI(s["cf_token"])
         cfg = load_config(root)
         say(chat, "⚙️ ساخت منابع مورد نیاز... (نام ورکر: %s)" % worker)
-        cfg, created, warnings, cands, used_auto = prepare_config(
+        cfg, created, warnings, cands, used_auto, extra = prepare_config(
             cfg, root, cf, s["acc"], worker, progress=lambda m: say(chat, m))
-        s.update(cfg=cfg, created=created, warnings=warnings, used_auto=used_auto)
+        s.update(cfg=cfg, created=created, warnings=warnings, used_auto=used_auto,
+                 gen_vars=extra["gen_vars"], vars_randomized=extra["vars_randomized"])
         if cands:
             s["state"] = "vars"
             say(chat, "کد این متغیرهای محیطی رو می‌خونه:\n" + "\n".join("• " + c for c in cands) +
@@ -528,7 +581,10 @@ def job_deploy(chat):
     try:
         root, cfg, acc, worker = s["root"], s["cfg"], s["acc"], s["worker"]
         cf = CloudflareAPI(s["cf_token"])
-        sub = ensure_subdomain(cf, acc)
+        sub, serr = get_subdomain(cf, acc)
+        if not sub:
+            ask_subdomain(chat, "deploy", serr)
+            return
         base_env = {"PATH": os.environ.get("PATH", ""), "HOME": s["work"], "CI": "true", "NO_COLOR": "1",
                     "FORCE_COLOR": "0", "WRANGLER_SEND_METRICS": "false", "npm_config_cache": os.path.join(s["work"], ".npm")}
         wr_env = dict(base_env, CLOUDFLARE_API_TOKEN=s["cf_token"], CLOUDFLARE_ACCOUNT_ID=acc)
@@ -574,6 +630,7 @@ def job_deploy(chat):
             set_secrets["CF_ACCOUNT_ID"] = acc
         if "WORKER_NAME" in s.get("used_auto", []):
             set_secrets["WORKER_NAME"] = worker
+        set_secrets.update(s.get("gen_vars", {}))
         set_secrets.update(s.get("user_vars", {}))
         for k, v in set_secrets.items():
             try:
@@ -590,9 +647,19 @@ def job_deploy(chat):
             if "CF_API_TOKEN" in set_secrets:
                 lines.append("(چون کد از env.CF_API_TOKEN استفاده می‌کنه، توکنت به‌عنوان secret روی همین ورکر ذخیره شد.)")
             lines.append("")
+        if s.get("uuid_report") or s.get("vars_randomized"):
+            lines.append("🔐 UUID های ثابت داخل ریپو برای این دیپلوی رندوم شدن:")
+            for f, n, old in s.get("uuid_report", []):
+                lines.append("• %s (%d مورد، قبلی: %s…)" % (f, n, old))
+            for k in s.get("vars_randomized", []):
+                lines.append("• متغیر %s توی wrangler config" % k)
+            lines.append("")
+        for k, v in s.get("gen_vars", {}).items():
+            if k in set_secrets:
+                lines.append("🔑 %s (رندوم‌شده و به‌عنوان secret ست شد): %s" % (k, v))
         for w in s.get("warnings", []) + notes:
             lines.append("⚠️ " + w)
-        lines.append("\nبرای ریپوی بعدی /start بزن.")
+        lines.append("\nورکر بعدی: /worker  |  ریپو: /repo")
         say(chat, "\n".join(lines))
         keep_auth(chat)
     except Exception as e:
@@ -685,24 +752,34 @@ def keep_auth(chat):
     sessions[chat] = dict(keep, state="idle")
 
 
+def ask_subdomain(chat, resume, err):
+    s = sess(chat)
+    s["state"] = "subname"
+    s["resume"] = resume
+    say(chat, "⚠️ ساب‌دامین workers.dev حساب پیدا نشد" + (" (%s)" % err[:150] if err else "") + ".\n\n"
+        "اگه حسابت از قبل ساب‌دامین داره، /cancel بزن و چک کن توکن دسترسی خوندن Workers رو داره؛ "
+        "چون ست کردن اسم جدید، ساب‌دامین فعلی رو عوض می‌کنه.\n"
+        "اگه نداره، اسم دلخواهت رو بفرست (انگلیسی کوچک، عدد و خط تیره). آدرس‌ها میشن:\n"
+        "<اسم ورکر>.<اسمی که الان می‌فرستی>.workers.dev")
+
+
 def job_worker(chat):
     s = sess(chat)
     secrets = [s.get("cf_token")]
     s["state"] = "busy"
     try:
         cf, acc, name, domain = CloudflareAPI(s["cf_token"]), s["acc"], s["wname"], s.get("wdomain")
+        sub, serr = get_subdomain(cf, acc)
+        if not sub:
+            ask_subdomain(chat, "worker", serr)
+            return
         say(chat, "🚀 در حال ساخت ورکر %s ..." % name)
         upload_worker(cf, acc, name, s["wcode"], s["wkind"])
-        sub = ensure_subdomain(cf, acc)
         try:
             cf.call("POST", "/accounts/%s/workers/scripts/%s/subdomain" % (acc, name), json={"enabled": True})
         except CFError as e:
             log("subdomain enable failed", e)
-        urls, notes = [], []
-        if sub:
-            urls.append("https://%s.%s.workers.dev" % (name, sub))
-        else:
-            notes.append("ساب‌دامین workers.dev برای حساب ساخته نشد؛ آدرس رو از داشبورد ببین.")
+        urls, notes = ["https://%s.%s.workers.dev" % (name, sub)], []
         if domain:
             try:
                 zid, zname = find_zone(cf, domain)
@@ -796,6 +873,14 @@ def handle(msg):
             s.update(state="token", next=mode)
             say(chat, "اول Cloudflare API Token رو بفرست (پیامت بعد از خوندن پاک میشه).")
         return
+    if text == "/subdomain":
+        if not s.get("cf_token"):
+            say(chat, "اول /worker یا /repo رو بزن و توکن بده.")
+            return
+        sub, err = get_subdomain(CloudflareAPI(s["cf_token"]), s["acc"])
+        say(chat, ("ساب‌دامین فعلی حساب: %s.workers.dev\n(برای تغییر از داشبورد Workers & Pages استفاده کن؛ ربات اسم موجود رو عوض نمی‌کنه.)" % sub)
+            if sub else "ساب‌دامینی پیدا نشد%s. موقع اولین دیپلوی ازت می‌پرسم." % (" (%s)" % err[:120] if err else ""))
+        return
     if text == "/logout":
         reset(chat)
         say(chat, "توکن از حافظه‌ی ربات پاک شد.")
@@ -844,7 +929,31 @@ def handle(msg):
             say(chat, "لینک گیت‌هاب معتبر نیست. مثل: https://github.com/user/repo")
             return
         s["repo"] = r
+        if r["name"]:
+            start_prepare(chat)
+            return
+        s["state"] = "rname"
+        say(chat, "اسم ورکر رو بفرست (انگلیسی کوچک، عدد و خط تیره).\nدیتابیس و KV هم با همین اسم ساخته میشن.\n"
+                  "برای اسم پیش‌فرض (%s) یه - بفرست." % sanitize_name(r["repo"]))
+        return
+    if st == "rname":
+        word = text.split()[0] if text.split() else "-"
+        s["repo"]["name"] = None if word == "-" else word
         start_prepare(chat)
+        return
+    if st == "subname":
+        nm = text.strip().lower()
+        if not re.match(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", nm):
+            say(chat, "اسم معتبر نیست. فقط حروف کوچک انگلیسی، عدد و خط تیره.")
+            return
+        try:
+            set_subdomain(CloudflareAPI(s["cf_token"]), s["acc"], nm)
+        except CFError as e:
+            say(chat, "❌ %s\nیه اسم دیگه امتحان کن (اسم‌ها بین همه‌ی حساب‌ها یکتان)." % scrub(str(e), [s["cf_token"]])[:250])
+            return
+        say(chat, "✅ ساب‌دامین حساب: %s.workers.dev" % nm)
+        s["state"] = "busy"
+        threading.Thread(target=job_worker if s.get("resume") == "worker" else job_deploy, args=(chat,), daemon=True).start()
         return
     if st == "ghtoken":
         tg("deleteMessage", chat_id=chat, message_id=msg["message_id"])
