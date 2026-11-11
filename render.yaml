@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: cf-deploy-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
