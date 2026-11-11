@@ -460,6 +460,8 @@ WELCOME = (
     "• Workers R2 Storage: Edit (اگه ریپو R2 می‌خواد)\n• Queues: Edit (اگه Queue می‌خواد)\n"
     "• Account Settings: Read\n\n"
     "ساخت توکن: dash.cloudflare.com/profile/api-tokens\n"
+    "• برای وصل کردن دامنه‌ی خودت هم Zone → Zone:Read لازمه.\n\n"
+    "بعد از ورود توکن:\n/repo ← دیپلوی ریپوی گیت‌هاب\n/worker ← ساخت ورکر از کد آماده\n/logout ← پاک کردن توکن از حافظه\n"
     "فقط ریپوهای خودت رو بده، چون کدشون روی سرور ربات build میشه."
 )
 
@@ -592,31 +594,215 @@ def job_deploy(chat):
             lines.append("⚠️ " + w)
         lines.append("\nبرای ریپوی بعدی /start بزن.")
         say(chat, "\n".join(lines))
-        shutil.rmtree(s["work"], ignore_errors=True)
-        sessions.pop(chat, None)
+        keep_auth(chat)
     except Exception as e:
         fail(chat, e, secrets)
+
+
+# --------------------------------------------------------------------------- quick worker (paste code -> deploy)
+def strip_fences(t):
+    t = t.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else ""
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip() + "\n"
+
+
+def worker_kind(code):
+    if re.search(r"\bexport\s+(default|\{)", code):
+        return "module"
+    if re.search(r"addEventListener\s*\(\s*['\"]fetch['\"]", code):
+        return "service"
+    return None
+
+
+def syntax_check(code, kind):
+    fd, p = tempfile.mkstemp(suffix=".mjs" if kind == "module" else ".js")
+    os.close(fd)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(code)
+        r = subprocess.run(["node", "--check", p], capture_output=True, text=True, timeout=30)
+        return r.returncode == 0, tail(r.stderr or "", 6)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return True, ""
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def upload_worker(cf, acc, name, code, kind):
+    if kind == "module":
+        meta = {"main_module": "worker.js", "compatibility_date": COMPAT_DATE, "compatibility_flags": ["nodejs_compat"]}
+        files = {"metadata": (None, json.dumps(meta), "application/json"),
+                 "worker.js": ("worker.js", code.encode("utf-8"), "application/javascript+module")}
+    else:
+        meta = {"body_part": "script.js", "compatibility_date": COMPAT_DATE}
+        files = {"metadata": (None, json.dumps(meta), "application/json"),
+                 "script.js": ("script.js", code.encode("utf-8"), "application/javascript")}
+    cf.call("PUT", "/accounts/%s/workers/scripts/%s" % (acc, name), files=files)
+
+
+def find_zone(cf, host):
+    labels = host.split(".")
+    for i in range(len(labels) - 1):
+        cand = ".".join(labels[i:])
+        z = cf.call("GET", "/zones", params={"name": cand, "per_page": 1})
+        if z:
+            return z[0]["id"], cand
+    return None, None
+
+
+def probe(url, tries):
+    for i in range(tries):
+        try:
+            r = requests.get(url, timeout=10)
+            return r.status_code, (r.text or "").strip()[:200]
+        except Exception:
+            if i < tries - 1:
+                time.sleep(4)
+    return None, ""
+
+
+def tg_download(file_id):
+    info = tg("getFile", file_id=file_id)
+    path = (info.get("result") or {}).get("file_path")
+    if not path:
+        raise RuntimeError("دانلود فایل از تلگرام ممکن نشد.")
+    r = requests.get("https://api.telegram.org/file/bot%s/%s" % (TG_TOKEN, path), timeout=60)
+    r.raise_for_status()
+    return r.content.decode("utf-8", errors="replace")
+
+
+def keep_auth(chat):
+    old = sessions.get(chat) or {}
+    if old.get("work"):
+        shutil.rmtree(old["work"], ignore_errors=True)
+    keep = {k: old[k] for k in ("cf_token", "acc") if k in old}
+    sessions[chat] = dict(keep, state="idle")
+
+
+def job_worker(chat):
+    s = sess(chat)
+    secrets = [s.get("cf_token")]
+    s["state"] = "busy"
+    try:
+        cf, acc, name, domain = CloudflareAPI(s["cf_token"]), s["acc"], s["wname"], s.get("wdomain")
+        say(chat, "🚀 در حال ساخت ورکر %s ..." % name)
+        upload_worker(cf, acc, name, s["wcode"], s["wkind"])
+        sub = ensure_subdomain(cf, acc)
+        try:
+            cf.call("POST", "/accounts/%s/workers/scripts/%s/subdomain" % (acc, name), json={"enabled": True})
+        except CFError as e:
+            log("subdomain enable failed", e)
+        urls, notes = [], []
+        if sub:
+            urls.append("https://%s.%s.workers.dev" % (name, sub))
+        else:
+            notes.append("ساب‌دامین workers.dev برای حساب ساخته نشد؛ آدرس رو از داشبورد ببین.")
+        if domain:
+            try:
+                zid, zname = find_zone(cf, domain)
+                if not zid:
+                    notes.append("دامنه %s توی حساب کلودفلرت پیدا نشد (اول باید به کلودفلر اضافه شده باشه)." % domain)
+                else:
+                    cf.call("PUT", "/accounts/%s/workers/domains" % acc,
+                            json={"environment": "production", "hostname": domain, "service": name, "zone_id": zid})
+                    urls.insert(0, "https://" + domain)
+            except CFError as e:
+                notes.append("وصل کردن دامنه ناموفق بود: %s\n(توکن باید Zone:Read و دسترسی Workers داشته باشه)" % str(e)[:250])
+        lines = ["✅ ورکر %s ساخته و دیپلوی شد." % name, ""]
+        for u in urls:
+            lines.append("🌐 " + u)
+        if urls:
+            say(chat, "\n".join(lines) + "\n\n🔎 در حال تست آدرس‌ها ...")
+            lines = []
+            for u in urls:
+                status, body = probe(u, 6 if u.endswith(".workers.dev") else 2)
+                if status is None:
+                    lines.append("⏳ %s هنوز جواب نداد (انتشار DNS/SSL ممکنه چند دقیقه طول بکشه)" % u)
+                else:
+                    lines.append("%s %s → HTTP %s\n%s" % ("✔" if status < 400 else "⚠️", u, status, body))
+        for n in notes:
+            lines.append("⚠️ " + n)
+        lines.append("\nورکر بعدی: /worker  |  ریپو: /repo")
+        say(chat, "\n".join(lines))
+        keep_auth(chat)
+    except Exception as e:
+        fail(chat, e, secrets)
+
+
+WORKER_PROMPT = (
+    "کد ورکر رو بفرست (متن، یا اگه طولانیه به‌صورت فایل .js).\n"
+    "هر دو فرمت قبوله: export default { fetch } یا addEventListener('fetch', ...)."
+)
+NAME_PROMPT = (
+    "کد معتبره ✅\n"
+    "حالا اسم ورکر رو بفرست (انگلیسی کوچک، عدد و خط تیره).\n"
+    "اگه دامنه‌ی خودت رو هم می‌خوای وصل کنم، بعد از اسم بنویس:\n"
+    "hello hello.example.com\n"
+    "(دامنه باید از قبل توی همین حساب کلودفلر باشه.)"
+)
+
+
+def ask_mode(chat, mode):
+    s = sess(chat)
+    if mode == "worker":
+        s["state"] = "wcode"
+        say(chat, WORKER_PROMPT)
+    else:
+        s["state"] = "repo"
+        say(chat, "لینک ریپوی گیت‌هاب رو بفرست.\n"
+                  "اگه اسم دلخواه برای ورکر می‌خوای بعد از لینک بنویس:\nhttps://github.com/user/repo myname")
+
+
+def clear_job(chat):
+    old = sessions.get(chat)
+    if old and old.get("work"):
+        shutil.rmtree(old["work"], ignore_errors=True)
+    keep = {k: old[k] for k in ("cf_token", "acc") if old and k in old}
+    sessions[chat] = dict(keep, state="idle")
 
 
 def handle(msg):
     chat = msg["chat"]["id"]
     uid = msg.get("from", {}).get("id")
-    text = (msg.get("text") or "").strip()
+    text = (msg.get("text") or msg.get("caption") or "").strip()
     if msg["chat"].get("type") != "private":
         return
     if ALLOWED and uid not in ALLOWED:
         say(chat, "⛔ دسترسی نداری. آیدی عددی تو: %s" % uid)
         return
     s = sess(chat)
-    if text in ("/start", "/new", "/help"):
+    if text in ("/start", "/help"):
         reset(chat)
         s = sess(chat)
-        s["state"] = "token"
+        s.update(state="token", next="repo")
         say(chat, WELCOME)
         return
-    if text == "/cancel":
+    if text in ("/repo", "/worker"):
+        if s["state"] == "busy":
+            say(chat, "⏳ یه عملیات در حال انجامه، صبر کن.")
+            return
+        mode = text[1:]
+        clear_job(chat)
+        s = sess(chat)
+        if s.get("cf_token"):
+            ask_mode(chat, mode)
+        else:
+            s.update(state="token", next=mode)
+            say(chat, "اول Cloudflare API Token رو بفرست (پیامت بعد از خوندن پاک میشه).")
+        return
+    if text == "/logout":
         reset(chat)
-        say(chat, "لغو شد. /start")
+        say(chat, "توکن از حافظه‌ی ربات پاک شد.")
+        return
+    if text == "/cancel":
+        clear_job(chat)
+        say(chat, "لغو شد. /repo یا /worker")
         return
     st = s["state"]
     if st == "busy":
@@ -640,16 +826,15 @@ def handle(msg):
                 "%d) %s" % (i + 1, a["name"]) for i, a in enumerate(accs)))
             return
         s["acc"] = accs[0]["id"]
-        s["state"] = "repo"
-        say(chat, "✅ توکن معتبره (حساب: %s).\n\nحالا لینک ریپوی گیت‌هاب رو بفرست.\n"
-                  "اگه اسم دلخواه برای ورکر می‌خوای بعد از لینک بنویس:\nhttps://github.com/user/repo myname" % accs[0]["name"])
+        say(chat, "✅ توکن معتبره (حساب: %s)." % accs[0]["name"])
+        ask_mode(chat, s.get("next", "repo"))
         return
     if st == "account":
         if text.isdigit() and 1 <= int(text) <= len(s["accs"]):
             a = s["accs"][int(text) - 1]
             s["acc"] = a["id"]
-            s["state"] = "repo"
-            say(chat, "✅ حساب %s انتخاب شد. لینک ریپوی گیت‌هاب رو بفرست." % a["name"])
+            say(chat, "✅ حساب %s انتخاب شد." % a["name"])
+            ask_mode(chat, s.get("next", "repo"))
         else:
             say(chat, "یه شماره‌ی معتبر بفرست.")
         return
@@ -679,7 +864,68 @@ def handle(msg):
         s["state"] = "busy"
         threading.Thread(target=job_deploy, args=(chat,), daemon=True).start()
         return
-    say(chat, "برای شروع /start بزن.")
+    if st == "wcode":
+        doc = msg.get("document")
+        try:
+            if doc:
+                if doc.get("file_size", 0) > 2 * 1024 * 1024:
+                    say(chat, "فایل بزرگ‌تر از ۲ مگابایته.")
+                    return
+                code = tg_download(doc["file_id"])
+            else:
+                code = text
+        except Exception as e:
+            say(chat, "❌ " + str(e))
+            return
+        code = strip_fences(code)
+        kind = worker_kind(code)
+        if not kind:
+            say(chat, "❌ کد ورکر معتبر نیست. باید export default { fetch } یا addEventListener('fetch', ...) داشته باشه. دوباره بفرست.")
+            return
+        if re.search(r"""(from\s+|import\s*\(\s*)['"]\.{1,2}/""", code):
+            say(chat, "❌ کد به فایل‌های دیگه import داره (./...). این بخش فقط کد تک‌فایلی رو دیپلوی می‌کنه؛ برای پروژه‌ی چندفایلی از /repo استفاده کن.")
+            return
+        ok, err = syntax_check(code, kind)
+        if not ok:
+            say(chat, "❌ کد خطای سینتکس داره:\n" + err + "\n\nاصلاحش کن و دوباره بفرست.")
+            return
+        s["wcode"], s["wkind"] = code, kind
+        s["state"] = "wname"
+        say(chat, NAME_PROMPT)
+        return
+    if st in ("wname", "wconfirm"):
+        if st == "wconfirm":
+            if text.strip().lower() in ("بله", "yes", "y", "ok", "آره"):
+                s["state"] = "busy"
+                threading.Thread(target=job_worker, args=(chat,), daemon=True).start()
+            else:
+                s["state"] = "wname"
+                say(chat, "باشه، یه اسم دیگه بفرست.")
+            return
+        parts = text.split()
+        if not parts:
+            say(chat, "اسم ورکر رو بفرست.")
+            return
+        name = sanitize_name(parts[0])
+        domain = parts[1].lower() if len(parts) > 1 and parts[1] != "-" else None
+        if domain and not re.match(r"^(?=.{4,253}$)([a-z0-9-]+\.)+[a-z]{2,}$", domain):
+            say(chat, "دامنه معتبر نیست. مثل: hello.example.com")
+            return
+        s["wname"], s["wdomain"] = name, domain
+        try:
+            existing = {x.get("id") for x in CloudflareAPI(s["cf_token"]).call(
+                "GET", "/accounts/%s/workers/scripts" % s["acc"]) or []}
+        except Exception as e:
+            say(chat, "❌ " + scrub(str(e), [s["cf_token"]])[:300])
+            return
+        if name in existing:
+            s["state"] = "wconfirm"
+            say(chat, "⚠️ ورکری با اسم %s از قبل وجود داره و جایگزین میشه. ادامه بدم؟ (بله / نه)" % name)
+            return
+        s["state"] = "busy"
+        threading.Thread(target=job_worker, args=(chat,), daemon=True).start()
+        return
+    say(chat, "برای دیپلوی ریپو /repo و برای ساخت ورکر از کد آماده /worker بزن.")
 
 
 # --------------------------------------------------------------------------- server / loop
@@ -714,6 +960,12 @@ def main():
     threading.Thread(target=health_server, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
     tg("deleteWebhook", drop_pending_updates=False)  # polling needs no webhook set
+    tg("setMyCommands", commands=[
+        {"command": "start", "description": "شروع و وارد کردن توکن"},
+        {"command": "repo", "description": "دیپلوی ریپوی گیت‌هاب"},
+        {"command": "worker", "description": "ساخت ورکر از کد آماده"},
+        {"command": "cancel", "description": "لغو عملیات"},
+        {"command": "logout", "description": "پاک کردن توکن"}])
     log("bot started")
     offset = None
     while True:
